@@ -1,20 +1,26 @@
+
+
+
 import logging
 import os
 import json
+import asyncio
+from datetime import datetime, timedelta, timezone
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters, ChatMemberHandler
 )
-from datetime import timezone
+from telegram.error import RetryAfter, TimedOut, Forbidden, BadRequest
 
-BOT_TOKEN = '7173724242:AAFdkl2FunWVBfP0w2RUEXY_iU-Ivho_Fm8'
+BOT_TOKEN = '7173724242:AAFdkl2FunWVBfP0w2RUEXY_iU-Ivho_Fm8'  # подставь свой токен
 
 # Файл для хранения списка зарегистрированных чатов
 DATA_FILE = 'registered_chats.json'
 
 # Список разрешённых @username в Телеграм
-ALLOWED_USERNAMES = {  'Eggmmaann', 'SpammBotsss' }
+ALLOWED_USERNAMES = {'Eggmmaann', 'SpammBotsss'}
 
 # Загрузка зарегистрированных чатов
 if os.path.exists(DATA_FILE):
@@ -32,8 +38,11 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# Словарь для хранения запланированных заданий
+# Словарь для хранения запланированных заданий (по пользователю)
 scheduled_jobs = {}
+
+# Кулдауны по чатам: chat_id -> datetime, когда можно снова слать
+chat_cooldowns = {}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -46,14 +55,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Проверяем, есть ли @username пользователя в списке разрешённых
     if username not in ALLOWED_USERNAMES:
-        # Сообщение на немецком
         await update.message.reply_text(
             "Hallo, möchtest du auch so einen Bot? "
             "Schreib mir @SpammBotss, du kannst ihn einen Tag lang kostenlos ausprobieren."
         )
         return
 
-    # Если пользователь в списке разрешённых, показываем кнопки
     keyboard = [
         [
             InlineKeyboardButton("📂 Chats ansehen", callback_data='view_chats'),
@@ -100,9 +107,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"📂 Der Bot ist in folgenden Chats hinzugefügt:\n{chat_list}")
         else:
             await query.message.reply_text("🚫 Der Bot ist in keinem Chat hinzugefügt.")
+
     elif query.data == 'send_message':
         user_data[user_id] = {'state': 'awaiting_interval'}
         await query.message.reply_text("⏰ Bitte geben Sie das Intervall in Minuten für das Senden der Nachricht ein.")
+
     elif query.data == 'stop_broadcast':
         if user_id in scheduled_jobs:
             job = scheduled_jobs[user_id]
@@ -133,6 +142,7 @@ async def receive_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except ValueError:
                 await update.message.reply_text("⚠️ Bitte geben Sie eine positive ganze Zahl ein.")
+
         elif state == 'awaiting_broadcast_message':
             message_to_forward = update.message
             interval = user_data[user_id]['interval']
@@ -152,9 +162,10 @@ async def receive_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user_id in scheduled_jobs:
                 scheduled_jobs[user_id].schedule_removal()
 
+            # Запускаем повторяющуюся задачу с тем же интервалом (в секундах)
             job = job_queue.run_repeating(
                 send_scheduled_message,
-                interval=interval * 60,  # секунды
+                interval=interval * 60,
                 first=0,
                 data={'message': message_to_forward, 'chats': registered_chats, 'user_id': user_id}
             )
@@ -168,10 +179,6 @@ async def receive_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Возвращаемся к кнопкам
             await start(update, context)
-        else:
-            pass
-    else:
-        pass
 
 
 async def send_scheduled_message(context: ContextTypes.DEFAULT_TYPE):
@@ -183,7 +190,19 @@ async def send_scheduled_message(context: ContextTypes.DEFAULT_TYPE):
     from_chat_id = message_to_forward.chat_id
     message_id = message_to_forward.message_id
 
-    for chat_id, chat_title in chats:
+    now = datetime.now(timezone.utc)
+
+    # Копия, чтобы можно было удалять чаты
+    chats_list = list(chats)
+    chats_to_remove = set()
+
+    for chat_id, chat_title in chats_list:
+        # Проверяем кулдаун для этого чата
+        cooldown_until = chat_cooldowns.get(chat_id)
+        if cooldown_until and cooldown_until > now:
+            # Еще рано слать — Telegram сказал ждать
+            continue
+
         try:
             await context.bot.forward_message(
                 chat_id=chat_id,
@@ -191,8 +210,59 @@ async def send_scheduled_message(context: ContextTypes.DEFAULT_TYPE):
                 message_id=message_id
             )
             logging.info(f"✅ Nachricht an Chat {chat_title} ({chat_id}) gesendet.")
+
+            # Лимит Telegram: желательно не долбить сразу десятки чатов
+            await asyncio.sleep(0.2)  # 5 сообщений в секунду — безопаснее
+
+        except RetryAfter as e:
+            # Telegram явно сказал, сколько секунд ждать
+            retry_seconds = int(getattr(e, "retry_after", 60))
+            chat_cooldowns[chat_id] = now + timedelta(seconds=retry_seconds)
+            logging.error(
+                f"❌ Flood control in Chat {chat_title} ({chat_id}): "
+                f"Retry after {retry_seconds} seconds."
+            )
+
+        except Forbidden as e:
+            # Бот потерял доступ к чату
+            logging.error(
+                f"❌ Kein Zugriff mehr auf Chat {chat_title} ({chat_id}): {e}. "
+                f"Chat wird aus der Liste entfernt."
+            )
+            chats_to_remove.add((chat_id, chat_title))
+
+        except BadRequest as e:
+            msg = str(e)
+            logging.error(
+                f"❌ BadRequest beim Senden an Chat {chat_title} ({chat_id}): {msg}"
+            )
+
+            # Чат заблокировал бота, или сообщение нельзя переслать
+            if "Chat_restricted" in msg or "can't be forwarded" in msg:
+                chats_to_remove.add((chat_id, chat_title))
+
+        except TimedOut as e:
+            # Временный таймаут — чат оставляем, просто логируем
+            logging.error(
+                f"❌ Timed out beim Senden an Chat {chat_title} ({chat_id}): {e}"
+            )
+
         except Exception as e:
-            logging.error(f"❌ Nachricht an Chat {chat_title} ({chat_id}) konnte nicht gesendet werden: {e}")
+            # Любая другая ошибка
+            logging.error(
+                f"❌ Nachricht an Chat {chat_title} ({chat_id}) konnte nicht gesendet werden: {e}"
+            )
+
+    # Удаляем чаты, где навсегда запрещена пересылка или бот не имеет доступа
+    if chats_to_remove:
+        for chat_tuple in chats_to_remove:
+            if chat_tuple in registered_chats:
+                registered_chats.discard(chat_tuple)
+        save_registered_chats()
+        logging.info(
+            f"ℹ️ Entfernte dauer-problematische Chats: "
+            f"{', '.join([str(c[1]) for c in chats_to_remove])}"
+        )
 
 
 async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,8 +273,10 @@ async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_T
     new_status = result.new_chat_member.status
     old_status = result.old_chat_member.status
 
-    logging.info(f"my_chat_member-Update: Chat '{chat_title}' ({chat_id}), "
-                 f"alter Status: {old_status}, neuer Status: {new_status}")
+    logging.info(
+        f"my_chat_member-Update: Chat '{chat_title}' ({chat_id}), "
+        f"alter Status: {old_status}, neuer Status: {new_status}"
+    )
 
     if old_status in ['left', 'kicked'] and new_status in ['member', 'administrator']:
         registered_chats.add((chat_id, chat_title))
@@ -234,5 +306,4 @@ def main():
 
 
 if __name__ == '__main__':
-     main()
-
+    main()
